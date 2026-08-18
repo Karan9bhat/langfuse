@@ -129,14 +129,27 @@ describe("AzureManagedIdentityCredentialProvider", () => {
 });
 
 describe("bindManagedCredentialToRedis", () => {
+  // Mirrors ioredis, where duplicate() is `new Redis({ ...this.options })`: the
+  // copy is a fresh instance that inherits neither patched methods nor event
+  // subscriptions, and holds a by-value snapshot of the options.
   function fakeRedisClient() {
+    const handlers: Record<string, () => void> = {};
     const client = {
       options: {} as { username?: string; password?: string },
       status: "wait" as string,
+      handlers,
       connect: vi.fn(async () => {
         client.status = "ready";
       }),
       call: vi.fn(async () => "OK"),
+      once: vi.fn((event: string, handler: () => void) => {
+        handlers[event] = handler;
+      }),
+      duplicate: vi.fn(() => {
+        const copy = fakeRedisClient();
+        copy.options = { ...client.options };
+        return copy;
+      }),
     };
     return client;
   }
@@ -194,6 +207,78 @@ describe("bindManagedCredentialToRedis", () => {
     await client.connect();
     expect(client.options.password).toBe("token-1");
     expect(originalConnect).toHaveBeenCalledTimes(1);
+    manager.stop();
+  });
+
+  it("keeps duplicated connections refreshing on the shared token", async () => {
+    vi.useFakeTimers();
+    const provider = fakeProvider({ username: "object-id-123" });
+    const client = fakeRedisClient();
+
+    const manager = bindManagedCredentialToRedis(
+      client as unknown as Redis,
+      provider,
+    );
+    await client.connect();
+
+    // BullMQ builds its blocking connection by duplicating the one it is given.
+    const blocking = client.duplicate();
+    await blocking.connect();
+    expect(blocking.options.password).toBe("token-1");
+
+    // The copy joins the existing manager instead of starting its own refresh
+    // loop, so one token still serves every connection.
+    expect(provider.fetchToken).toHaveBeenCalledTimes(1);
+
+    // On refresh both connections re-AUTH. Before duplicate() was wrapped the
+    // copy was never notified: it kept a stale password and stopped working at
+    // the first expiry, silently halting job consumption.
+    await vi.advanceTimersByTimeAsync(ONE_HOUR * 0.8);
+    expect(client.options.password).toBe("token-2");
+    expect(blocking.options.password).toBe("token-2");
+    expect(blocking.call).toHaveBeenCalledWith(
+      "AUTH",
+      "object-id-123",
+      "token-2",
+    );
+    manager.stop();
+  });
+
+  it("refreshes connections duplicated from a duplicate", async () => {
+    vi.useFakeTimers();
+    const provider = fakeProvider();
+    const client = fakeRedisClient();
+
+    const manager = bindManagedCredentialToRedis(
+      client as unknown as Redis,
+      provider,
+    );
+    await client.connect();
+
+    const nested = client.duplicate().duplicate();
+    await nested.connect();
+    expect(provider.fetchToken).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(ONE_HOUR * 0.8);
+    expect(nested.options.password).toBe("token-2");
+    manager.stop();
+  });
+
+  it("stops refreshing a connection once it has ended", async () => {
+    vi.useFakeTimers();
+    const provider = fakeProvider();
+    const client = fakeRedisClient();
+
+    const manager = bindManagedCredentialToRedis(
+      client as unknown as Redis,
+      provider,
+    );
+    await client.connect();
+
+    // A closed connection must not keep receiving AUTH for every rotation.
+    client.handlers.end();
+    await vi.advanceTimersByTimeAsync(ONE_HOUR * 0.8);
+    expect(client.call).not.toHaveBeenCalled();
     manager.stop();
   });
 });

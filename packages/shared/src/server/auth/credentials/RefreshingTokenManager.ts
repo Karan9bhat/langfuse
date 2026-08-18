@@ -19,6 +19,8 @@ export class RefreshingTokenManager {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private readonly listeners = new Set<RefreshListener>();
+  private current: ManagedAccessToken | null = null;
+  private starting: Promise<ManagedAccessToken> | null = null;
 
   constructor(
     provider: ManagedCredentialProvider,
@@ -35,12 +37,32 @@ export class RefreshingTokenManager {
     this.expirationRefreshRatio = ratio;
   }
 
-  // Fetch the first token and arm the refresh-ahead timer.
+  // Fetch the first token and arm the refresh-ahead timer. Always fetches, so a
+  // start() after stop() restarts the lifecycle.
   public async start(): Promise<ManagedAccessToken> {
     this.stopped = false;
     const token = await this.provider.fetchToken();
+    this.current = token;
     this.scheduleRefresh(token);
     return token;
+  }
+
+  // Idempotent entry point for connections that share one manager. Hands back
+  // the token already held, or the fetch already in flight, instead of issuing a
+  // request per connection -- Langfuse opens enough Redis connections that
+  // per-connection token fetches would risk throttling at the token endpoint.
+  public async ensureStarted(): Promise<ManagedAccessToken> {
+    if (this.current && Date.now() < this.current.expiresOnTimestamp) {
+      return this.current;
+    }
+
+    if (!this.starting) {
+      this.starting = this.start().finally(() => {
+        this.starting = null;
+      });
+    }
+
+    return this.starting;
   }
 
   public onRefresh(listener: RefreshListener): () => void {
@@ -76,6 +98,7 @@ export class RefreshingTokenManager {
     if (this.stopped) return;
     try {
       const token = await this.provider.fetchToken();
+      this.current = token;
       this.notify(token);
       this.scheduleRefresh(token);
     } catch (error) {

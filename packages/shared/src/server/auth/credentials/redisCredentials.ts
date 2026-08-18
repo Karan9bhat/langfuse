@@ -26,6 +26,15 @@ export function getRedisManagedCredentialProviderFromEnv(): ManagedCredentialPro
 // uses lazyConnect so nothing connects until this wrapper runs; ioredis routes
 // both explicit connect() and command-triggered auto-connect through connect(),
 // which closes the race with callers like BullMQ that connect on their own.
+//
+// duplicate() is wrapped for the same reason. ioredis implements it as
+// `new Redis({ ...this.options })`, so a copy inherits neither this wrapper nor
+// the refresh subscription, and carries a by-value snapshot of the password.
+// BullMQ builds its blocking connection that way, so without this a worker
+// authenticates once and is never renewed: at the first token expiry the server
+// drops it, the reconnect replays a stale password, and job consumption stops
+// while producers keep enqueuing successfully. Copies share the manager, so one
+// token still serves every connection.
 export function bindManagedCredentialToRedis(
   client: Redis,
   provider: ManagedCredentialProvider,
@@ -38,7 +47,7 @@ export function bindManagedCredentialToRedis(
     if (provider.username) client.options.username = provider.username;
   };
 
-  manager.onRefresh((token) => {
+  const unsubscribe = manager.onRefresh((token) => {
     applyToken(token);
     const authArgs = provider.username
       ? [provider.username, token.token]
@@ -53,12 +62,16 @@ export function bindManagedCredentialToRedis(
       );
   });
 
+  // Drop the subscription once the connection is closed for good, so a process
+  // that churns connections does not accumulate listeners AUTHing dead sockets.
+  client.once("end", unsubscribe);
+
   const connect = client.connect.bind(client);
   let bootstrap: Promise<void> | null = null;
   client.connect = ((...args: Parameters<Redis["connect"]>) => {
     if (!bootstrap) {
       bootstrap = manager
-        .start()
+        .ensureStarted()
         .then(applyToken)
         .catch((error) => {
           bootstrap = null; // let the next connect attempt retry the token fetch
@@ -71,6 +84,13 @@ export function bindManagedCredentialToRedis(
     }
     return bootstrap.then(() => connect(...args));
   }) as Redis["connect"];
+
+  const duplicate = client.duplicate.bind(client);
+  client.duplicate = ((...args: Parameters<Redis["duplicate"]>) => {
+    const copy = duplicate(...args);
+    bindManagedCredentialToRedis(copy, provider, { manager });
+    return copy;
+  }) as Redis["duplicate"];
 
   return manager;
 }
